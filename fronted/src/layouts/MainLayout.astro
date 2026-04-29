@@ -4,12 +4,43 @@ const { title } = Astro.props;
 
 <html>
   <head>
+    <meta charset="UTF-8" />
     <title>{title}</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 20px;
+        border-bottom: 1px solid #ddd;
+      }
+      nav a {
+        margin-left: 12px;
+        text-decoration: none;
+        color: black;
+        font-weight: bold;
+      }
+      nav a:hover {
+        text-decoration: underline;
+      }
+      main {
+        padding: 20px;
+      }
+    </style>
   </head>
   <body>
     <header>
       <h2>Yote</h2>
-      <hr />
+
+      <nav>
+        <a href="/">Home</a>
+        <a href="/login">Login</a>
+        <a href="/register">Register</a>
+      </nav>
     </header>
 
     <main>
