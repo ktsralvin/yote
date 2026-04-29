@@ -1,0 +1,22 @@
+---
+import MainLayout from "../layouts/MainLayout.astro";
+import ArticleCard from "../components/ArticleCard.astro";
+
+const articles = [
+  { id: 1, title: "Belajar Astro", content: "Astro itu cepat dan modern." },
+  { id: 2, title: "Belajar Go", content: "Go cocok untuk backend API." },
+  { id: 3, title: "Belajar Docker", content: "Container bikin hidup lebih mudah." },
+];
+---
+
+<MainLayout title="Home">
+  <h1>Artikel Terbaru</h1>
+
+  {articles.map(article => (
+    <ArticleCard
+      id={article.id}
+      title={article.title}
+      content={article.content}
+   />
+  ))}
+</MainLayout>

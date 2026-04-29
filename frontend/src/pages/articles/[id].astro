@@ -1,0 +1,26 @@
+---
+export const prerender = false;
+import MainLayout from "../../layouts/MainLayout.astro";
+
+const { id } = Astro.params;
+
+// dummy data (nanti dari backend)
+const articles = [
+  { id: "1", title: "Belajar Astro", content: "Astro itu cepat dan modern." },
+  { id: "2", title: "Belajar Go", content: "Go cocok untuk backend API." },
+  { id: "3", title: "Belajar Docker", content: "Container bikin hidup lebih mudah." },
+];
+
+const article = articles.find(a => a.id === id);
+---
+
+<MainLayout title="Detail Artikel">
+  {article ? (
+    <>
+      <h1>{article.title}</h1>
+      <p>{article.content}</p>
+    </>
+  ) : (
+    <p>Artikel tidak ditemukan</p>
+  )}
+</MainLayout>
