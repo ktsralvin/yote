@@ -1,7 +1,59 @@
 ---
 import MainLayout from "../layouts/MainLayout.astro";
+
+let message = "";
+
+if (Astro.request.method === "POST") {
+  const data = await Astro.request.formData();
+
+  const email = data.get("email");
+  const password = data.get("password");
+
+  try {
+    const res = await fetch("http://192.168.56.105:8080/login", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email,
+        password,
+      }),
+    });
+
+    if (res.ok) {
+      const result = await res.json();
+      message = result.message;
+    } else {
+      const text = await res.text();
+      message = text;
+    }
+  } catch (err) {
+    message = "Server error";
+  }
+}
 ---
 
 <MainLayout title="Login">
-  <h1>Login Page</h1>
+  <h1>Login</h1>
+
+  <form method="POST">
+    <div>
+      <label>Email</label><br />
+      <input type="email" name="email" required />
+    </div>
+
+    <br />
+
+    <div>
+      <label>Password</label><br />
+      <input type="password" name="password" required />
+    </div>
+
+    <br />
+
+    <button type="submit">Login</button>
+  </form>
+
+  {message && <p>{message}</p>}
 </MainLayout>

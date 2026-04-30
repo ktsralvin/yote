@@ -2,20 +2,15 @@
 import MainLayout from "../layouts/MainLayout.astro";
 
 let message = "";
-let name = "";
-let email = "";
 
 if (Astro.request.method === "POST") {
   const data = await Astro.request.formData();
-
-  name = data.get("name")?.toString() || "";
-  email = data.get("email")?.toString() || "";
+  const name = data.get("name");
+  const email = data.get("email");
   const password = data.get("password");
   const confirm = data.get("confirm");
 
-  if (!email.includes("@")) {
-    message = "Email tidak valid";
-  } else if (password !== confirm) {
+  if (password !== confirm) {
     message = "Password tidak sama";
   } else {
     message = "Register berhasil (dummy)";
@@ -37,6 +32,9 @@ if (Astro.request.method === "POST") {
     <div>
       <label>Email</label><br />
       <input type="email" name="email" required />
+    if (!email.includes("@")) {
+  message = "Email tidak valid";
+}
     </div>
 
     <br />
