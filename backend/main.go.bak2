@@ -1,0 +1,616 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+var jwtSecret = []byte("secret_key_yote")
+var db *sql.DB
+
+// ================= RESPONSE HELPER =================
+
+func jsonResponse(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
+}
+
+func successResponse(w http.ResponseWriter, data interface{}) {
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    data,
+	})
+}
+
+func errorResponse(w http.ResponseWriter, status int, message string) {
+	jsonResponse(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+// ================= TYPES =================
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type RegisterRequest struct {
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type CreateArticleRequest struct {
+	Title    string `json:"title"`
+	Content  string `json:"content"`
+	MediaIDs []int  `json:"media_ids"`
+}
+
+type ArticleResponse struct {
+	ID      int      `json:"id"`
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Media   []string `json:"media"`
+}
+
+// ================= AUTH =================
+
+func hashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	return string(bytes), err
+}
+
+func checkPassword(hash, password string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req LoginRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	var userID int
+	var hashedPassword string
+
+	err = db.QueryRow(`
+		SELECT id, password_hash
+		FROM users
+		WHERE email = $1 AND is_active = true
+	`, req.Email).Scan(&userID, &hashedPassword)
+
+	if err == sql.ErrNoRows {
+		errorResponse(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	} else if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "DB error")
+		return
+	}
+
+	if !checkPassword(hashedPassword, req.Password) {
+		errorResponse(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	}
+
+	token, err := generateToken(userID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to generate token")
+		return
+	}
+
+	successResponse(w, map[string]interface{}{
+		"token": token,
+	})
+}
+
+func validateRegister(req RegisterRequest) error {
+	if req.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if req.Email == "" {
+		return fmt.Errorf("email is required")
+	}
+	if req.Password == "" {
+		return fmt.Errorf("password is required")
+	}
+	if len(req.Password) < 6 {
+		return fmt.Errorf("password must be at least 6 characters")
+	}
+	return nil
+}
+
+func registerHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req RegisterRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	if err := validateRegister(req); err != nil {
+		errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	hashedPassword, err := hashPassword(req.Password)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to hash password")
+		return
+	}
+
+	var userID int
+
+	err = db.QueryRow(`
+		INSERT INTO users (name, email, password_hash)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, req.Name, req.Email, hashedPassword).Scan(&userID)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "users_email_key") {
+			errorResponse(w, http.StatusBadRequest, "Email already registered")
+			return
+		}
+
+		log.Println("REGISTER ERROR:", err)
+		errorResponse(w, http.StatusInternalServerError, "Failed to register")
+		return
+	}
+
+	token, err := generateToken(userID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to generate token")
+		return
+	}
+
+	successResponse(w, map[string]interface{}{
+		"user_id": userID,
+		"token":   token,
+	})
+}
+
+// ================= MIDDLEWARE =================
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+
+		if authHeader == "" {
+			errorResponse(w, http.StatusUnauthorized, "Missing token")
+			return
+		}
+
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 {
+			errorResponse(w, http.StatusUnauthorized, "Invalid token format")
+			return
+		}
+
+		userID, err := parseToken(parts[1])
+		if err != nil {
+			errorResponse(w, http.StatusUnauthorized, "Invalid token")
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "user_id", userID)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// ================= UPLOAD =================
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodOptions {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "File too large")
+		return
+	}
+
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid file")
+		return
+	}
+	defer file.Close()
+
+	ext := filepath.Ext(handler.Filename)
+	filename := uuid.New().String() + ext
+
+	dst, err := os.Create("/home/alvin/yote/uploads/" + filename)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Cannot save file")
+		return
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, file)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to save file")
+		return
+	}
+
+	url := "http://192.168.56.105:8080/uploads/" + filename
+
+	var mediaID int
+
+	err = db.QueryRow(`
+		INSERT INTO media (file_url, file_type, mime_type)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, url, ext, handler.Header.Get("Content-Type")).Scan(&mediaID)
+
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to save to DB")
+		return
+	}
+
+	successResponse(w, map[string]interface{}{
+		"url": url,
+		"id":  mediaID,
+	})
+}
+
+// ================= ARTICLES =================
+
+func createArticleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req CreateArticleRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	var articleID int
+
+	slug := strings.ToLower(req.Title)
+	slug = strings.ReplaceAll(slug, " ", "-")
+
+	authorID := r.Context().Value("user_id").(int)
+
+	err = tx.QueryRow(`
+		INSERT INTO articles (title, content, slug, author_id)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, req.Title, req.Content, slug, authorID).Scan(&articleID)
+
+	if err != nil {
+		log.Println("ARTICLE ERROR:", err)
+		errorResponse(w, http.StatusInternalServerError, "Failed to create article")
+		return
+	}
+
+	for _, mediaID := range req.MediaIDs {
+		var exists int
+		err = tx.QueryRow("SELECT 1 FROM media WHERE id = $1", mediaID).Scan(&exists)
+
+		if err == sql.ErrNoRows {
+			errorResponse(w, http.StatusBadRequest, "Media ID not found")
+			return
+		} else if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "DB error")
+			return
+		}
+	}
+
+	for _, mediaID := range req.MediaIDs {
+		_, err = tx.Exec(`
+			INSERT INTO article_media (article_id, media_id)
+			VALUES ($1, $2)
+		`, articleID, mediaID)
+
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "Failed to link media")
+			return
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Commit failed")
+		return
+	}
+
+	successResponse(w, map[string]interface{}{
+		"id": articleID,
+	})
+}
+
+func getArticlesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT a.id, a.title, a.content, m.file_url
+		FROM articles a
+		LEFT JOIN article_media am ON am.article_id = a.id
+		LEFT JOIN media m ON m.id = am.media_id
+		WHERE a.deleted_at IS NULL
+		ORDER BY a.id
+	`)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to fetch articles")
+		return
+	}
+	defer rows.Close()
+
+	articlesMap := make(map[int]*ArticleResponse)
+
+	for rows.Next() {
+		var id int
+		var title, content string
+		var fileURL sql.NullString
+
+		err := rows.Scan(&id, &title, &content, &fileURL)
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "Scan error")
+			return
+		}
+
+		if _, exists := articlesMap[id]; !exists {
+			articlesMap[id] = &ArticleResponse{
+				ID:      id,
+				Title:   title,
+				Content: content,
+				Media:   []string{},
+			}
+		}
+
+		if fileURL.Valid {
+			articlesMap[id].Media = append(articlesMap[id].Media, fileURL.String)
+		}
+	}
+
+	var result []ArticleResponse
+	for _, v := range articlesMap {
+		result = append(result, *v)
+	}
+
+	successResponse(w, result)
+}
+
+func updateArticleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		errorResponse(w, http.StatusBadRequest, "Missing article id")
+		return
+	}
+
+	var req CreateArticleRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	slug := strings.ToLower(req.Title)
+	slug = strings.ReplaceAll(slug, " ", "-")
+
+	_, err = tx.Exec(`
+		UPDATE articles
+		SET title = $1, content = $2, slug = $3
+		WHERE id = $4
+	`, req.Title, req.Content, slug, id)
+
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to update article")
+		return
+	}
+
+	for _, mediaID := range req.MediaIDs {
+		var exists int
+		err = tx.QueryRow("SELECT 1 FROM media WHERE id = $1", mediaID).Scan(&exists)
+
+		if err == sql.ErrNoRows {
+			errorResponse(w, http.StatusBadRequest, "Media ID not found")
+			return
+		} else if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "DB error")
+			return
+		}
+	}
+
+	_, err = tx.Exec(`DELETE FROM article_media WHERE article_id = $1`, id)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to delete old media")
+		return
+	}
+
+	for _, mediaID := range req.MediaIDs {
+		_, err = tx.Exec(`
+			INSERT INTO article_media (article_id, media_id)
+			VALUES ($1, $2)
+		`, id, mediaID)
+
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "Failed to insert media")
+			return
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Commit failed")
+		return
+	}
+
+	successResponse(w, "Article updated")
+}
+
+func deleteArticleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		errorResponse(w, http.StatusBadRequest, "Missing article id")
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	var exists int
+	err = tx.QueryRow(`
+		SELECT 1 FROM articles WHERE id = $1 AND deleted_at IS NULL
+	`, id).Scan(&exists)
+
+	if err == sql.ErrNoRows {
+		errorResponse(w, http.StatusNotFound, "Article not found")
+		return
+	} else if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "DB error")
+		return
+	}
+
+	_, err = tx.Exec(`UPDATE articles SET deleted_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to delete article")
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Commit failed")
+		return
+	}
+
+	successResponse(w, "Article deleted")
+}
+
+// ================= JWT =================
+
+func generateToken(userID int) (string, error) {
+	claims := jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(24 * time.Hour).Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+func parseToken(tokenStr string) (int, error) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+
+	if err != nil || !token.Valid {
+		return 0, err
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	return int(claims["user_id"].(float64)), nil
+}
+
+// ================= MAIN =================
+
+func main() {
+	var err error
+
+	db, err = sql.Open("postgres", "postgres://yote_user:yote@localhost:5432/yote_db?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatal("DB connection failed:", err)
+	}
+
+	http.HandleFunc("/login", loginHandler)
+	http.HandleFunc("/register", registerHandler)
+	http.HandleFunc("/upload", uploadHandler)
+
+	http.HandleFunc("/articles", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			authMiddleware(createArticleHandler)(w, r)
+		} else if r.Method == http.MethodGet {
+			getArticlesHandler(w, r)
+		} else {
+			errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		}
+	})
+
+	http.HandleFunc("/articles/update", authMiddleware(updateArticleHandler))
+	http.HandleFunc("/articles/delete", authMiddleware(deleteArticleHandler))
+
+	http.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("/home/alvin/yote/uploads"))))
+
+	log.Println("Server running on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}

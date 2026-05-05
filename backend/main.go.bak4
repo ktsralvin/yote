@@ -143,10 +143,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-            errorResponse(w, 400, "Invalid request")
-            return
-        }
+	json.NewDecoder(r.Body).Decode(&req)
 
 	if err := validateRegister(req); err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
@@ -184,13 +181,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		parts := strings.Split(auth, " ")
-                if len(parts) != 2 {
-                    errorResponse(w, 401, "Invalid token format")
-                    return
-                }
-                token := parts[1]
-
+		token := strings.Split(auth, " ")[1]
 		userID, err := parseToken(token)
 		if err != nil {
 			errorResponse(w, 401, "Invalid token")
@@ -218,28 +209,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, handler, err := r.FormFile("file")
-        if err != nil {
-            errorResponse(w, 400, "Invalid file")
-            return
-        }
-
-        defer file.Close()
+	file, handler, _ := r.FormFile("file")
+	defer file.Close()
 
 	filename := uuid.New().String() + filepath.Ext(handler.Filename)
 
-	dst, err := os.Create("/home/alvin/yote/uploads/" + filename)
-        if err != nil {
-            errorResponse(w, 500, "Failed to save file")
-            return
-        }
-        defer dst.Close()
+	dst, _ := os.Create("/home/alvin/yote/uploads/" + filename)
+	defer dst.Close()
 
-        _, err = io.Copy(dst, file)
-        if err != nil {
-            errorResponse(w, 500, "Failed to write file")
-            return
-        }
+	io.Copy(dst, file)
 
 	url := "http://localhost:8080/uploads/" + filename
 
@@ -259,144 +237,48 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 func createArticleHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateArticleRequest
-        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-            errorResponse(w, 400, "Invalid request")
-            return
-        }
+	json.NewDecoder(r.Body).Decode(&req)
 
-        tx, err := db.Begin()
-        if err != nil {
-            errorResponse(w, 500, "Failed to start transaction")
-            return
-        }
-
+	tx, _ := db.Begin()
 	defer tx.Rollback()
 
 	userID := r.Context().Value("user_id").(int)
 	slug := strings.ReplaceAll(strings.ToLower(req.Title), " ", "-")
 
 	var articleID int
-	err = tx.QueryRow(`
-            INSERT INTO articles (title, content, slug, author_id, is_public)
-            VALUES ($1,$2,$3,$4,$5) RETURNING id
-        `, req.Title, req.Content, slug, userID, req.IsPublic).Scan(&articleID)
+	tx.QueryRow(`
+		INSERT INTO articles (title, content, slug, author_id, is_public)
+		VALUES ($1,$2,$3,$4,$5) RETURNING id
+	`, req.Title, req.Content, slug, userID, req.IsPublic).Scan(&articleID)
 
-        if err != nil {
-            errorResponse(w, 500, "Failed to create article")
-            return
-        }
-
-        err = tx.Commit()
-        if err != nil {
-            errorResponse(w, 500, "Commit failed")
-            return
-        }
+	tx.Commit()
 
 	successResponse(w, map[string]interface{}{"id": articleID})
 }
 
 func getArticlesHandler(w http.ResponseWriter, r *http.Request) {
-	// pagination
-	page := 1
-	limit := 10
-
-	if p := r.URL.Query().Get("page"); p != "" {
-		fmt.Sscanf(p, "%d", &page)
-	}
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 || limit > 50 {
-		limit = 10
-	}
-
-	offset := (page - 1) * limit
-
-	// total count
-	var total int
-	err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM articles
-		WHERE deleted_at IS NULL AND is_public = true
-	`).Scan(&total)
-
-	if err != nil {
-		errorResponse(w, 500, "Failed to count articles")
-		return
-	}
-
-	// query with media + author
 	rows, err := db.Query(`
-		SELECT 
-			a.id,
-			a.title,
-			a.content,
-			u.username,
-			m.file_url
+		SELECT a.id, a.title, a.content, u.username
 		FROM articles a
 		JOIN users u ON u.id = a.author_id
-		LEFT JOIN article_media am ON am.article_id = a.id
-		LEFT JOIN media m ON m.id = am.media_id
 		WHERE a.deleted_at IS NULL AND a.is_public = true
 		ORDER BY a.id DESC
-		LIMIT $1 OFFSET $2
-	`, limit, offset)
-
+	`)
 	if err != nil {
 		errorResponse(w, 500, "DB error")
 		return
 	}
 	defer rows.Close()
 
-	articlesMap := make(map[int]*ArticleResponse)
+	var result []ArticleResponse
 
 	for rows.Next() {
-		var id int
-		var title, content string
-                var author sql.NullString
-		var fileURL sql.NullString
-
-		err := rows.Scan(&id, &title, &content, &author, &fileURL)
-		if err != nil {
-			errorResponse(w, 500, "Scan error")
-			return
-		}
-
-		if _, exists := articlesMap[id]; !exists {
-			authorStr := ""
-                        if author.Valid {
-                            authorStr = author.String
-                        }
-
-                        articlesMap[id] = &ArticleResponse{
-				ID:      id,
-				Title:   title,
-				Content: content,
-				Author:  authorStr,
-				Media:   []string{},
-			}
-		}
-
-		if fileURL.Valid {
-			articlesMap[id].Media = append(articlesMap[id].Media, fileURL.String)
-		}
+		var a ArticleResponse
+		rows.Scan(&a.ID, &a.Title, &a.Content, &a.Author)
+		result = append(result, a)
 	}
 
-	result := []ArticleResponse{}
-	for _, v := range articlesMap {
-		result = append(result, *v)
-	}
-
-	successResponse(w, map[string]interface{}{
-		"articles": result,
-		"page":     page,
-		"limit":    limit,
-		"total":    total,
-	})
+	successResponse(w, result)
 }
 
 func updateArticleHandler(w http.ResponseWriter, r *http.Request) {
@@ -512,7 +394,7 @@ func getMyArticlesHandler(w http.ResponseWriter, r *http.Request) {
 		IsPublic bool   `json:"is_public"`
 	}
 
-        articles := []MyArticle{}
+	var articles []MyArticle
 
 	for rows.Next() {
 		var a MyArticle

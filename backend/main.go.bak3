@@ -68,7 +68,6 @@ type ArticleResponse struct {
 	ID      int      `json:"id"`
 	Title   string   `json:"title"`
 	Content string   `json:"content"`
-	Author  string   `json:"author"`
 	Media   []string `json:"media"`
 }
 
@@ -76,7 +75,7 @@ type ArticleResponse struct {
 
 func hashPassword(password string) (string, error) {
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 12)
-        return string(bytes), err
+	return string(bytes), err
 }
 
 func checkPassword(hash, password string) bool {
@@ -117,7 +116,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _ := generateToken(userID)
+	token, err := generateToken(userID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to generate token")
+		return
+	}
 
 	successResponse(w, map[string]interface{}{
 		"token": token,
@@ -127,11 +130,20 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 // ================= REGISTER =================
 
 func validateRegister(req RegisterRequest) error {
-	if req.Name == "" || req.Username == "" || req.Email == "" || req.Password == "" {
-		return fmt.Errorf("all fields required")
+	if req.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if req.Username == "" {
+		return fmt.Errorf("username is required")
+	}
+	if req.Email == "" {
+		return fmt.Errorf("email is required")
+	}
+	if req.Password == "" {
+		return fmt.Errorf("password is required")
 	}
 	if len(req.Password) < 6 {
-		return fmt.Errorf("password min 6 char")
+		return fmt.Errorf("password must be at least 6 characters")
 	}
 	return nil
 }
@@ -144,29 +156,49 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-            errorResponse(w, 400, "Invalid request")
-            return
-        }
+		errorResponse(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
 
 	if err := validateRegister(req); err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	hash, _ := hashPassword(req.Password)
-
-	var userID int
-	err := db.QueryRow(`
-		INSERT INTO users (name, username, email, password_hash)
-		VALUES ($1,$2,$3,$4) RETURNING id
-	`, req.Name, req.Username, req.Email, hash).Scan(&userID)
-
+	hashedPassword, err := hashPassword(req.Password)
 	if err != nil {
-		errorResponse(w, 400, "Email/Username already used")
+		errorResponse(w, http.StatusInternalServerError, "Failed to hash password")
 		return
 	}
 
-	token, _ := generateToken(userID)
+	var userID int
+
+	err = db.QueryRow(`
+		INSERT INTO users (name, username, email, password_hash)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, req.Name, req.Username, req.Email, hashedPassword).Scan(&userID)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "users_email_key") {
+			errorResponse(w, http.StatusBadRequest, "Email already registered")
+			return
+		}
+		if strings.Contains(err.Error(), "users_username_key") {
+			errorResponse(w, http.StatusBadRequest, "Username already taken")
+			return
+		}
+
+		log.Println(err)
+		errorResponse(w, http.StatusInternalServerError, "Failed to register")
+		return
+	}
+
+	token, err := generateToken(userID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to generate token")
+		return
+	}
 
 	successResponse(w, map[string]interface{}{
 		"user_id": userID,
@@ -178,22 +210,22 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth == "" {
-			errorResponse(w, 401, "Missing token")
+		authHeader := r.Header.Get("Authorization")
+
+		if authHeader == "" {
+			errorResponse(w, http.StatusUnauthorized, "Missing token")
 			return
 		}
 
-		parts := strings.Split(auth, " ")
-                if len(parts) != 2 {
-                    errorResponse(w, 401, "Invalid token format")
-                    return
-                }
-                token := parts[1]
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 {
+			errorResponse(w, http.StatusUnauthorized, "Invalid token format")
+			return
+		}
 
-		userID, err := parseToken(token)
+		userID, err := parseToken(parts[1])
 		if err != nil {
-			errorResponse(w, 401, "Invalid token")
+			errorResponse(w, http.StatusUnauthorized, "Invalid token")
 			return
 		}
 
@@ -205,49 +237,50 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // ================= UPLOAD =================
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	userIDVal := r.Context().Value("user_id")
-	if userIDVal == nil {
-		errorResponse(w, 401, "Unauthorized")
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	userID := userIDVal.(int)
 
 	err := r.ParseMultipartForm(10 << 20)
 	if err != nil {
-		errorResponse(w, 400, "File too large")
+		errorResponse(w, http.StatusBadRequest, "File too large")
 		return
 	}
 
 	file, handler, err := r.FormFile("file")
-        if err != nil {
-            errorResponse(w, 400, "Invalid file")
-            return
-        }
-
-        defer file.Close()
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid file")
+		return
+	}
+	defer file.Close()
 
 	filename := uuid.New().String() + filepath.Ext(handler.Filename)
 
 	dst, err := os.Create("/home/alvin/yote/uploads/" + filename)
-        if err != nil {
-            errorResponse(w, 500, "Failed to save file")
-            return
-        }
-        defer dst.Close()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Cannot save file")
+		return
+	}
+	defer dst.Close()
 
-        _, err = io.Copy(dst, file)
-        if err != nil {
-            errorResponse(w, 500, "Failed to write file")
-            return
-        }
+	io.Copy(dst, file)
 
 	url := "http://localhost:8080/uploads/" + filename
 
 	var mediaID int
-	db.QueryRow(`
-		INSERT INTO media (file_url, file_type, mime_type, uploader_id)
-		VALUES ($1,$2,$3,$4) RETURNING id
-	`, url, filepath.Ext(handler.Filename), handler.Header.Get("Content-Type"), userID).Scan(&mediaID)
+	err = db.QueryRow(`
+		INSERT INTO media (file_url, file_type, mime_type)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, url, filepath.Ext(handler.Filename), handler.Header.Get("Content-Type")).Scan(&mediaID)
+
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to save to DB")
+		return
+	}
 
 	successResponse(w, map[string]interface{}{
 		"id":  mediaID,
@@ -258,145 +291,73 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 // ================= ARTICLES =================
 
 func createArticleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
 	var req CreateArticleRequest
-        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-            errorResponse(w, 400, "Invalid request")
-            return
-        }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
 
-        tx, err := db.Begin()
-        if err != nil {
-            errorResponse(w, 500, "Failed to start transaction")
-            return
-        }
-
+	tx, _ := db.Begin()
 	defer tx.Rollback()
 
-	userID := r.Context().Value("user_id").(int)
-	slug := strings.ReplaceAll(strings.ToLower(req.Title), " ", "-")
-
 	var articleID int
-	err = tx.QueryRow(`
-            INSERT INTO articles (title, content, slug, author_id, is_public)
-            VALUES ($1,$2,$3,$4,$5) RETURNING id
-        `, req.Title, req.Content, slug, userID, req.IsPublic).Scan(&articleID)
+	slug := strings.ReplaceAll(strings.ToLower(req.Title), " ", "-")
+	userID := r.Context().Value("user_id").(int)
 
-        if err != nil {
-            errorResponse(w, 500, "Failed to create article")
-            return
-        }
+	err := tx.QueryRow(`
+		INSERT INTO articles (title, content, slug, author_id, is_public)
+		VALUES ($1,$2,$3,$4,$5)
+		RETURNING id
+	`, req.Title, req.Content, slug, userID, req.IsPublic).Scan(&articleID)
 
-        err = tx.Commit()
-        if err != nil {
-            errorResponse(w, 500, "Commit failed")
-            return
-        }
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Failed to create article")
+		return
+	}
+
+	tx.Commit()
 
 	successResponse(w, map[string]interface{}{"id": articleID})
 }
 
 func getArticlesHandler(w http.ResponseWriter, r *http.Request) {
-	// pagination
-	page := 1
-	limit := 10
+	var rows *sql.Rows
+	var err error
 
-	if p := r.URL.Query().Get("page"); p != "" {
-		fmt.Sscanf(p, "%d", &page)
-	}
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
-	}
+	userIDVal := r.Context().Value("user_id")
 
-	if page < 1 {
-		page = 1
+	if userIDVal != nil {
+		rows, err = db.Query(`
+			SELECT id, title, content FROM articles
+			WHERE is_public = true OR author_id = $1
+		`, userIDVal.(int))
+	} else {
+		rows, err = db.Query(`
+			SELECT id, title, content FROM articles
+			WHERE is_public = true
+		`)
 	}
-	if limit < 1 || limit > 50 {
-		limit = 10
-	}
-
-	offset := (page - 1) * limit
-
-	// total count
-	var total int
-	err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM articles
-		WHERE deleted_at IS NULL AND is_public = true
-	`).Scan(&total)
 
 	if err != nil {
-		errorResponse(w, 500, "Failed to count articles")
-		return
-	}
-
-	// query with media + author
-	rows, err := db.Query(`
-		SELECT 
-			a.id,
-			a.title,
-			a.content,
-			u.username,
-			m.file_url
-		FROM articles a
-		JOIN users u ON u.id = a.author_id
-		LEFT JOIN article_media am ON am.article_id = a.id
-		LEFT JOIN media m ON m.id = am.media_id
-		WHERE a.deleted_at IS NULL AND a.is_public = true
-		ORDER BY a.id DESC
-		LIMIT $1 OFFSET $2
-	`, limit, offset)
-
-	if err != nil {
-		errorResponse(w, 500, "DB error")
+		errorResponse(w, http.StatusInternalServerError, "DB error")
 		return
 	}
 	defer rows.Close()
 
-	articlesMap := make(map[int]*ArticleResponse)
+	var result []ArticleResponse
 
 	for rows.Next() {
-		var id int
-		var title, content string
-                var author sql.NullString
-		var fileURL sql.NullString
-
-		err := rows.Scan(&id, &title, &content, &author, &fileURL)
-		if err != nil {
-			errorResponse(w, 500, "Scan error")
-			return
-		}
-
-		if _, exists := articlesMap[id]; !exists {
-			authorStr := ""
-                        if author.Valid {
-                            authorStr = author.String
-                        }
-
-                        articlesMap[id] = &ArticleResponse{
-				ID:      id,
-				Title:   title,
-				Content: content,
-				Author:  authorStr,
-				Media:   []string{},
-			}
-		}
-
-		if fileURL.Valid {
-			articlesMap[id].Media = append(articlesMap[id].Media, fileURL.String)
-		}
+		var a ArticleResponse
+		rows.Scan(&a.ID, &a.Title, &a.Content)
+		result = append(result, a)
 	}
 
-	result := []ArticleResponse{}
-	for _, v := range articlesMap {
-		result = append(result, *v)
-	}
-
-	successResponse(w, map[string]interface{}{
-		"articles": result,
-		"page":     page,
-		"limit":    limit,
-		"total":    total,
-	})
+	successResponse(w, result)
 }
 
 func updateArticleHandler(w http.ResponseWriter, r *http.Request) {
@@ -405,13 +366,8 @@ func updateArticleHandler(w http.ResponseWriter, r *http.Request) {
 
 	var owner int
 	err := db.QueryRow(`SELECT author_id FROM articles WHERE id=$1`, id).Scan(&owner)
-	if err != nil {
-		errorResponse(w, 404, "Article not found")
-		return
-	}
-
 	if owner != userID {
-		errorResponse(w, 403, "Not your article")
+		errorResponse(w, http.StatusForbidden, "Not your article")
 		return
 	}
 
@@ -423,7 +379,7 @@ func updateArticleHandler(w http.ResponseWriter, r *http.Request) {
 	`, req.Title, req.Content, req.IsPublic, id)
 
 	if err != nil {
-		errorResponse(w, 500, "Failed to update")
+		errorResponse(w, http.StatusInternalServerError, "Failed to update")
 		return
 	}
 
@@ -435,97 +391,16 @@ func deleteArticleHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value("user_id").(int)
 
 	var owner int
-	err := db.QueryRow(`SELECT author_id FROM articles WHERE id=$1`, id).Scan(&owner)
-	if err != nil {
-		errorResponse(w, 404, "Article not found")
-		return
-	}
+	db.QueryRow(`SELECT author_id FROM articles WHERE id=$1`, id).Scan(&owner)
 
 	if owner != userID {
-		errorResponse(w, 403, "Not your article")
+		errorResponse(w, http.StatusForbidden, "Not your article")
 		return
 	}
 
 	db.Exec(`UPDATE articles SET deleted_at=NOW() WHERE id=$1`, id)
 
 	successResponse(w, "deleted")
-}
-
-// ============ Get My Article ===========
-
-func getMyArticlesHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("user_id").(int)
-
-	// pagination default
-	page := 1
-	limit := 10
-
-	// parse query
-	if p := r.URL.Query().Get("page"); p != "" {
-		fmt.Sscanf(p, "%d", &page)
-	}
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 || limit > 50 {
-		limit = 10
-	}
-
-	offset := (page - 1) * limit
-
-	// total count
-	var total int
-	err := db.QueryRow(`
-		SELECT COUNT(*) 
-		FROM articles 
-		WHERE author_id = $1 AND deleted_at IS NULL
-	`, userID).Scan(&total)
-
-	if err != nil {
-		errorResponse(w, 500, "Failed to count articles")
-		return
-	}
-
-	// query data
-	rows, err := db.Query(`
-		SELECT id, title, content, is_public
-		FROM articles
-		WHERE author_id = $1 AND deleted_at IS NULL
-		ORDER BY id DESC
-		LIMIT $2 OFFSET $3
-	`, userID, limit, offset)
-
-	if err != nil {
-		errorResponse(w, 500, "DB error")
-		return
-	}
-	defer rows.Close()
-
-	type MyArticle struct {
-		ID       int    `json:"id"`
-		Title    string `json:"title"`
-		Content  string `json:"content"`
-		IsPublic bool   `json:"is_public"`
-	}
-
-        articles := []MyArticle{}
-
-	for rows.Next() {
-		var a MyArticle
-		rows.Scan(&a.ID, &a.Title, &a.Content, &a.IsPublic)
-		articles = append(articles, a)
-	}
-
-	successResponse(w, map[string]interface{}{
-		"articles": articles,
-		"page":     page,
-		"limit":    limit,
-		"total":    total,
-	})
 }
 
 // ================= JWT =================
@@ -542,9 +417,11 @@ func parseToken(tokenStr string) (int, error) {
 	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
 		return jwtSecret, nil
 	})
+
 	if err != nil || !token.Valid {
 		return 0, err
 	}
+
 	return int(token.Claims.(jwt.MapClaims)["user_id"].(float64)), nil
 }
 
@@ -560,22 +437,23 @@ func main() {
 
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/register", registerHandler)
-
-	http.HandleFunc("/upload", authMiddleware(uploadHandler))
+	http.HandleFunc("/upload", uploadHandler)
 
 	http.HandleFunc("/articles", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			authMiddleware(createArticleHandler)(w, r)
 		} else if r.Method == http.MethodGet {
 			getArticlesHandler(w, r)
+		} else {
+			errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		}
 	})
 
 	http.HandleFunc("/articles/update", authMiddleware(updateArticleHandler))
 	http.HandleFunc("/articles/delete", authMiddleware(deleteArticleHandler))
-        http.HandleFunc("/me/articles", authMiddleware(getMyArticlesHandler))
+
 	http.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("/home/alvin/yote/uploads"))))
 
 	log.Println("Server running on :8080")
-	http.ListenAndServe(":8080", nil)
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
